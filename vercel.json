@@ -1,5 +1,7 @@
 {
   "rewrites": [
+    { "source": "/api/license/:path*", "destination": "/api" },
+    { "source": "/api/licenses/:path*", "destination": "/api" },
     { "source": "/(.*)", "destination": "/api" }
   ]
 }

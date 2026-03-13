@@ -3,353 +3,422 @@ export const config = { runtime: 'edge' };
 const SUPABASE_URL = "https://qolkgzbjrufrzbvsvjfh.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFvbGtnemJqcnVmcnpidnN2amZoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzMzNzA1MzIsImV4cCI6MjA4ODk0NjUzMn0.kY2btpEcRcbDMj10v5ZyLa_J2PnKsJQw4Yi9wp7LFD0";
 
-// Bank info for QR
-const BANK_CODE = "MB"; // MBBank
+const BANK_CODE = "MB";
 const BANK_ACCOUNT = "0388906356";
 const BANK_NAME = "NGUYEN KHAC TRUNG KHAI";
 
-// Package pricing
 const PACKAGES = {
-  1:  { months: 1,  days: 30,  amount: 299000,  label: "1 thang" },
-  3:  { months: 3,  days: 90,  amount: 800000,  label: "3 thang" },
-  6:  { months: 6,  days: 180, amount: 1500000, label: "6 thang" },
-  12: { months: 12, days: 365, amount: 2500000, label: "1 nam" }
+  1:  { months: 1,  days: 30,  amount: 299000,  label: "1 thang - 299,000 VND" },
+  3:  { months: 3,  days: 90,  amount: 800000,  label: "3 thang - 800,000 VND" },
+  6:  { months: 6,  days: 180, amount: 1500000, label: "6 thang - 1,500,000 VND" },
+  12: { months: 12, days: 365, amount: 2500000, label: "1 nam - 2,500,000 VND" }
 };
 
+// ==========================================
+// MAIN HANDLER - route by URL path + POST body
+// ==========================================
 export default async function handler(req) {
   const url = new URL(req.url);
-  const action = url.searchParams.get('action') || 'check';
-  const p = url.searchParams;
+  const path = url.pathname;
+
+  // Parse body (POST JSON) or query params
+  let body = {};
+  if (req.method === 'POST') {
+    try { body = await req.json(); } catch(e) {
+      try {
+        const text = await req.text();
+        text.split('&').forEach(p => { const [k,v] = p.split('='); if(k) body[decodeURIComponent(k)] = decodeURIComponent(v||''); });
+      } catch(e2) {}
+    }
+  }
+
+  // Merge query params into body (body takes priority)
+  url.searchParams.forEach((v, k) => { if (!body[k]) body[k] = v; });
+
+  // Also support ?action= for browser testing
+  const action = body.action || url.searchParams.get('action');
 
   try {
-    switch (action) {
-      case 'check':       return await checkLicense(p);
-      case 'register':    return await registerTrial(p);
-      case 'payment':     return await createPayment(p);
-      case 'activate':    return await activateLicense(p);
-      case 'login':       return await loginWithKey(p);
-      case 'packages':    return jsonResponse({ ok: true, data: PACKAGES });
-      default:            return jsonResponse({ ok: false, message: "Unknown action" });
+    // Route by path (original app format)
+    if (path.includes('/api/license/check-hwid') || path.includes('/api/license/check')) {
+      return await checkByHwid(body);
     }
+    if (path.includes('/api/license/login')) {
+      return await loginWithKey(body);
+    }
+    if (path.includes('/api/licenses/register') || path.includes('/api/license/register-payment')) {
+      if (path.includes('payment')) return await registerPayment(body);
+      return await registerTrial(body);
+    }
+    if (path.includes('/api/license/check-payment')) {
+      return await checkPayment(body, path);
+    }
+    if (path.includes('/api/license/renew-request')) {
+      return await renewRequest(body);
+    }
+
+    // Route by action param (for browser/manual testing)
+    if (action === 'check') return await checkByHwid(body);
+    if (action === 'login') return await loginWithKey(body);
+    if (action === 'register') return await registerTrial(body);
+    if (action === 'payment') return await registerPayment(body);
+    if (action === 'activate') return await activateLicense(body);
+    if (action === 'packages') return json({ ok: true, data: PACKAGES });
+
+    // Default: check by hwid
+    if (body.hwid) return await checkByHwid(body);
+
+    return json({ ok: false, message: "Unknown endpoint" });
   } catch (e) {
-    return jsonResponse({ ok: false, message: e.message });
+    return json({ ok: false, message: e.message });
   }
 }
 
 // ==========================================
-// CHECK LICENSE BY HWID (app goi khi mo)
+// CHECK BY HWID (app calls on startup)
 // ==========================================
-async function checkLicense(p) {
-  const hwid = p.get('hwid');
-  if (!hwid) return jsonResponse({ ok: false, message: "Missing hwid" });
+async function checkByHwid(body) {
+  const hwid = body.hwid;
+  if (!hwid) return json({ ok: false, status: 'error', message: 'Missing hwid' });
 
   const license = await getByHwid(hwid);
-  if (!license) return jsonResponse({ ok: false, message: "NotFound" });
-
-  const isExpired = new Date(license.expire_date) < new Date();
-
-  if (license.status !== 'active' || isExpired) {
-    return jsonResponse({
+  if (!license) {
+    return json({
       ok: false,
-      message: "License expired or inactive",
-      data: {
-        license_key: license.license_key,
-        expire_date: license.expire_date,
-        customer_name: license.customer_name,
-        status: isExpired ? 'expired' : license.status
-      }
+      status: 'not_found',
+      need_action: 'register',
+      message: 'NotFound'
     });
   }
 
-  return jsonResponse({
-    ok: true,
-    message: "Valid",
-    data: {
+  const now = new Date();
+  const expDate = new Date(license.expire_date);
+  const isExpired = expDate < now;
+  const daysRemaining = Math.max(0, Math.ceil((expDate - now) / 86400000));
+
+  if (license.status !== 'active' || isExpired) {
+    return json({
+      ok: false,
+      status: 'expired',
+      need_action: 'renew',
       license_key: license.license_key,
       expire_date: license.expire_date,
       customer_name: license.customer_name,
-      customer_phone: license.customer_phone,
-      status: license.status
-    }
+      days_remaining: 0,
+      message: 'License expired or inactive'
+    });
+  }
+
+  return json({
+    ok: true,
+    status: 'active',
+    license_key: license.license_key,
+    license_token: license.license_key,
+    expire_date: license.expire_date,
+    customer_name: license.customer_name,
+    customer_email: license.customer_email || '',
+    customer_phone: license.customer_phone || '',
+    days_remaining: daysRemaining,
+    server_time: now.toISOString(),
+    renewal_packages: Object.values(PACKAGES).map(p => ({
+      days: p.days, price: p.amount, label: p.label
+    }))
   });
 }
 
 // ==========================================
-// REGISTER TRIAL (dung thu 1 ngay, 1 lan/HWID)
+// LOGIN WITH LICENSE KEY
 // ==========================================
-async function registerTrial(p) {
-  const hwid = p.get('hwid');
-  const name = p.get('customer_name') || '';
-  const email = p.get('customer_email') || '';
-  const phone = p.get('customer_phone') || '';
+async function loginWithKey(body) {
+  const hwid = body.hwid;
+  const licenseKey = body.license_key || body.code;
 
-  if (!hwid) return jsonResponse({ ok: false, message: "Missing hwid" });
-  if (!name) return jsonResponse({ ok: false, message: "Missing customer_name" });
+  if (!hwid) return json({ ok: false, status: 'error', message: 'Missing hwid' });
+  if (!licenseKey) return json({ ok: false, status: 'error', message: 'Missing license_key' });
 
-  // Check if HWID already used trial
+  const license = await getByKey(licenseKey);
+  if (!license) return json({ ok: false, status: 'not_found', message: 'Invalid license key' });
+
+  const isExpired = new Date(license.expire_date) < new Date();
+  if (isExpired) return json({ ok: false, status: 'expired', message: 'License expired' });
+
+  // 1 key - 1 device
+  if (license.hwid && license.hwid !== hwid) {
+    return json({
+      ok: false,
+      status: 'device_transferred',
+      device_transferred: true,
+      message: 'License already used on another device'
+    });
+  }
+
+  // Bind key to HWID
+  if (!license.hwid || license.hwid === '') {
+    await supabasePatch('licenses', `license_key=eq.${licenseKey}`, { hwid });
+  }
+
+  const daysRemaining = Math.max(0, Math.ceil((new Date(license.expire_date) - new Date()) / 86400000));
+
+  return json({
+    ok: true,
+    status: 'active',
+    license_key: license.license_key,
+    license_token: license.license_key,
+    expire_date: license.expire_date,
+    customer_name: license.customer_name,
+    days_remaining: daysRemaining
+  });
+}
+
+// ==========================================
+// REGISTER TRIAL (1 day, 1 time per HWID)
+// ==========================================
+async function registerTrial(body) {
+  const hwid = body.hwid;
+  const name = body.customer_name || '';
+  const email = body.customer_email || '';
+  const phone = body.customer_phone || '';
+  const packageType = body.package_type;
+  const customMonths = parseInt(body.custom_months) || 0;
+
+  if (!hwid) return json({ ok: false, status: 'error', message: 'Missing hwid' });
+
+  // Check existing
   const existing = await getByHwid(hwid);
   if (existing) {
     if (existing.trial_used) {
-      return jsonResponse({ ok: false, message: "Trial already used on this device" });
+      return json({ ok: false, status: 'exists', message: 'Trial already used on this device' });
     }
-    return jsonResponse({ ok: false, message: "hwid.already.registered" });
+    return json({ ok: false, status: 'exists', message: 'hwid.already.registered' });
   }
 
-  // Generate license key
   const licenseKey = generateLicenseKey();
   const expireDate = new Date();
-  expireDate.setDate(expireDate.getDate() + 1); // 1 day trial
+  expireDate.setDate(expireDate.getDate() + 1);
 
   const res = await supabasePost('licenses', {
-    hwid: hwid,
-    license_key: licenseKey,
-    expire_date: formatDate(expireDate),
-    customer_name: name,
-    customer_email: email,
-    customer_phone: phone,
-    status: 'active',
-    trial_used: true,
-    is_trial: true,
-    package_months: 0
+    hwid, license_key: licenseKey,
+    expire_date: fmtDate(expireDate),
+    customer_name: name, customer_email: email, customer_phone: phone,
+    status: 'active', trial_used: true, is_trial: true, package_months: 0
   });
 
   if (!res.ok) {
     const err = await res.json();
-    if (err.code === '23505') return jsonResponse({ ok: false, message: "hwid.already.registered" });
-    return jsonResponse({ ok: false, message: err.message || "Register failed" });
+    if (err.code === '23505') return json({ ok: false, status: 'exists', message: 'hwid.already.registered' });
+    return json({ ok: false, message: err.message || 'Register failed' });
   }
 
-  const data = await res.json();
-  return jsonResponse({
+  return json({
     ok: true,
-    message: "Trial registered (1 day)",
-    data: {
-      license_key: licenseKey,
-      expire_date: formatDate(expireDate),
-      customer_name: name,
-      is_trial: true
-    }
+    status: 'success',
+    license_key: licenseKey,
+    license_token: licenseKey,
+    expire_date: fmtDate(expireDate),
+    customer_name: name,
+    days_remaining: 1
   });
 }
 
 // ==========================================
-// LOGIN WITH LICENSE KEY (bind to HWID)
+// REGISTER PAYMENT (create QR)
 // ==========================================
-async function loginWithKey(p) {
-  const hwid = p.get('hwid');
-  const licenseKey = p.get('license_key');
-
-  if (!hwid) return jsonResponse({ ok: false, message: "Missing hwid" });
-  if (!licenseKey) return jsonResponse({ ok: false, message: "Missing license_key" });
-
-  // Find license by key
-  const license = await getByKey(licenseKey);
-  if (!license) return jsonResponse({ ok: false, message: "Invalid license key" });
-
-  const isExpired = new Date(license.expire_date) < new Date();
-  if (isExpired) return jsonResponse({ ok: false, message: "License expired" });
-
-  // Check if key already bound to different HWID
-  if (license.hwid && license.hwid !== hwid) {
-    return jsonResponse({
-      ok: false,
-      message: "License already used on another device"
-    });
-  }
-
-  // Bind key to this HWID
-  if (!license.hwid) {
-    await supabasePatch('licenses', `license_key=eq.${licenseKey}`, {
-      hwid: hwid
-    });
-  }
-
-  return jsonResponse({
-    ok: true,
-    message: "Valid",
-    data: {
-      license_key: license.license_key,
-      expire_date: license.expire_date,
-      customer_name: license.customer_name,
-      status: license.status
-    }
-  });
-}
-
-// ==========================================
-// CREATE PAYMENT (tao QR thanh toan)
-// ==========================================
-async function createPayment(p) {
-  const hwid = p.get('hwid');
-  const licenseKey = p.get('license_key');
-  const months = parseInt(p.get('months'));
-  const name = p.get('customer_name') || '';
-  const email = p.get('customer_email') || '';
-  const phone = p.get('customer_phone') || '';
-
-  if (!months || !PACKAGES[months]) {
-    return jsonResponse({ ok: false, message: "Invalid package. Use months=1,3,6,12" });
-  }
+async function registerPayment(body) {
+  const hwid = body.hwid || '';
+  const name = body.customer_name || '';
+  const email = body.customer_email || '';
+  const phone = body.customer_phone || '';
+  const packageType = body.package_type;
+  const months = parseInt(body.custom_months || body.months) || 1;
 
   const pkg = PACKAGES[months];
-  const key = licenseKey || generateLicenseKey();
-  const transferContent = `ZVT ${key}`;
+  if (!pkg) return json({ ok: false, message: 'Invalid package' });
 
-  // VietQR URL
-  const qrUrl = `https://img.vietqr.io/image/${BANK_CODE}-${BANK_ACCOUNT}-compact.png?amount=${pkg.amount}&addInfo=${encodeURIComponent(transferContent)}&accountName=${encodeURIComponent(BANK_NAME)}`;
+  const licenseKey = body.license_key || generateLicenseKey();
+  const paymentCode = `ZVT${licenseKey.replace(/\./g, '')}`;
+  const qrUrl = `https://img.vietqr.io/image/${BANK_CODE}-${BANK_ACCOUNT}-compact.png?amount=${pkg.amount}&addInfo=${encodeURIComponent(paymentCode)}&accountName=${encodeURIComponent(BANK_NAME)}`;
 
-  // Save payment record
   await supabasePost('payments', {
-    license_key: key,
-    hwid: hwid || '',
-    customer_name: name,
-    customer_email: email,
-    customer_phone: phone,
-    package_months: months,
-    amount: pkg.amount,
-    transfer_content: transferContent,
-    payment_status: 'pending'
+    license_key: licenseKey, hwid,
+    customer_name: name, customer_email: email, customer_phone: phone,
+    package_months: months, amount: pkg.amount,
+    transfer_content: paymentCode, payment_status: 'pending'
   });
 
-  return jsonResponse({
+  return json({
     ok: true,
-    message: "Payment created",
-    data: {
-      license_key: key,
-      package: pkg.label,
+    status: 'pending',
+    license_key: licenseKey,
+    payment_code: paymentCode,
+    payment_info: {
+      payment_code: paymentCode,
       amount: pkg.amount,
-      amount_display: pkg.amount.toLocaleString('vi-VN') + " VND",
-      qr_url: qrUrl,
-      bank_name: "MBBank",
-      bank_account: BANK_ACCOUNT,
-      bank_owner: BANK_NAME,
-      transfer_content: transferContent
-    }
+      formatted_amount: pkg.amount.toLocaleString('vi-VN') + ' VND',
+      amount_formatted: pkg.amount.toLocaleString('vi-VN') + ' VND'
+    },
+    bank_info: {
+      bank_name: 'MBBank',
+      account_number: BANK_ACCOUNT,
+      account_name: BANK_NAME
+    },
+    qr_code_url: qrUrl,
+    qr_url: qrUrl,
+    qr_code: qrUrl,
+    package_label: pkg.label,
+    package_days: pkg.days
   });
 }
 
 // ==========================================
-// ACTIVATE LICENSE (sau khi xac nhan thanh toan)
+// CHECK PAYMENT STATUS
 // ==========================================
-async function activateLicense(p) {
-  const licenseKey = p.get('license_key');
-  const hwid = p.get('hwid');
+async function checkPayment(body, path) {
+  // Extract payment code from path: /api/license/check-payment/ZVT...
+  const parts = path.split('/');
+  const code = parts[parts.length - 1] || body.payment_code || body.code;
 
-  if (!licenseKey) return jsonResponse({ ok: false, message: "Missing license_key" });
+  if (!code || code === 'check-payment') {
+    return json({ ok: false, status: 'error', message: 'Missing payment code' });
+  }
 
-  // Find pending payment
-  const payRes = await supabaseGet('payments', `license_key=eq.${licenseKey}&payment_status=eq.pending&order=created_at.desc&limit=1`);
+  const payRes = await supabaseGet('payments', `transfer_content=eq.${code}&order=created_at.desc&limit=1`);
   const payments = await payRes.json();
 
   if (!payments || payments.length === 0) {
-    return jsonResponse({ ok: false, message: "No pending payment found" });
+    return json({ ok: false, status: 'not_found', message: 'Payment not found' });
   }
 
   const payment = payments[0];
-  const pkg = PACKAGES[payment.package_months];
-  if (!pkg) return jsonResponse({ ok: false, message: "Invalid package" });
+  return json({
+    ok: true,
+    status: payment.payment_status,
+    license_key: payment.license_key,
+    amount: payment.amount
+  });
+}
 
-  // Calculate expire date
-  const expireDate = new Date();
-  expireDate.setDate(expireDate.getDate() + pkg.days);
+// ==========================================
+// RENEW REQUEST
+// ==========================================
+async function renewRequest(body) {
+  const hwid = body.hwid;
+  const months = parseInt(body.months || body.custom_months) || 1;
 
-  // Check if license exists
-  const existing = await getByKey(licenseKey);
+  if (!hwid) return json({ ok: false, message: 'Missing hwid' });
 
-  if (existing) {
-    // Extend existing license
-    const currentExpire = new Date(existing.expire_date);
-    const now = new Date();
-    const base = currentExpire > now ? currentExpire : now;
-    base.setDate(base.getDate() + pkg.days);
+  const license = await getByHwid(hwid);
+  if (!license) return json({ ok: false, status: 'not_found', message: 'License not found' });
 
-    await supabasePatch('licenses', `license_key=eq.${licenseKey}`, {
-      expire_date: formatDate(base),
-      status: 'active',
-      is_trial: false,
-      package_months: payment.package_months
-    });
-  } else {
-    // Create new license
-    await supabasePost('licenses', {
-      hwid: hwid || '',
-      license_key: licenseKey,
-      expire_date: formatDate(expireDate),
-      customer_name: payment.customer_name,
-      customer_email: payment.customer_email,
-      customer_phone: payment.customer_phone,
-      status: 'active',
-      is_trial: false,
-      package_months: payment.package_months
-    });
-  }
+  const pkg = PACKAGES[months];
+  if (!pkg) return json({ ok: false, message: 'Invalid package' });
 
-  // Mark payment as paid
-  await supabasePatch('payments', `id=eq.${payment.id}`, {
-    payment_status: 'paid',
-    paid_at: new Date().toISOString()
+  const paymentCode = `ZVT${license.license_key.replace(/\./g, '')}`;
+  const qrUrl = `https://img.vietqr.io/image/${BANK_CODE}-${BANK_ACCOUNT}-compact.png?amount=${pkg.amount}&addInfo=${encodeURIComponent(paymentCode)}&accountName=${encodeURIComponent(BANK_NAME)}`;
+
+  await supabasePost('payments', {
+    license_key: license.license_key, hwid,
+    customer_name: license.customer_name,
+    customer_email: license.customer_email || '',
+    customer_phone: license.customer_phone || '',
+    package_months: months, amount: pkg.amount,
+    transfer_content: paymentCode, payment_status: 'pending'
   });
 
-  return jsonResponse({
+  return json({
     ok: true,
-    message: "License activated",
-    data: {
-      license_key: licenseKey,
-      expire_date: existing ? undefined : formatDate(expireDate),
-      package_months: payment.package_months
+    status: 'pending',
+    license_key: license.license_key,
+    payment_code: paymentCode,
+    qr_url: qrUrl,
+    qr_code_url: qrUrl,
+    bank_info: {
+      bank_name: 'MBBank',
+      account_number: BANK_ACCOUNT,
+      account_name: BANK_NAME
+    },
+    payment_info: {
+      payment_code: paymentCode,
+      amount: pkg.amount,
+      formatted_amount: pkg.amount.toLocaleString('vi-VN') + ' VND'
     }
   });
 }
 
 // ==========================================
-// HELPER FUNCTIONS
+// ACTIVATE (manual, admin use)
+// ==========================================
+async function activateLicense(body) {
+  const licenseKey = body.license_key;
+  if (!licenseKey) return json({ ok: false, message: 'Missing license_key' });
+
+  const payRes = await supabaseGet('payments', `license_key=eq.${licenseKey}&payment_status=eq.pending&order=created_at.desc&limit=1`);
+  const payments = await payRes.json();
+  if (!payments || payments.length === 0) return json({ ok: false, message: 'No pending payment' });
+
+  const payment = payments[0];
+  const pkg = PACKAGES[payment.package_months];
+  if (!pkg) return json({ ok: false, message: 'Invalid package' });
+
+  const existing = await getByKey(licenseKey);
+  const expireDate = new Date();
+  expireDate.setDate(expireDate.getDate() + pkg.days);
+
+  if (existing) {
+    const base = new Date(existing.expire_date) > new Date() ? new Date(existing.expire_date) : new Date();
+    base.setDate(base.getDate() + pkg.days);
+    await supabasePatch('licenses', `license_key=eq.${licenseKey}`, {
+      expire_date: fmtDate(base), status: 'active', is_trial: false, package_months: payment.package_months
+    });
+  } else {
+    await supabasePost('licenses', {
+      hwid: body.hwid || '', license_key: licenseKey,
+      expire_date: fmtDate(expireDate),
+      customer_name: payment.customer_name, customer_email: payment.customer_email || '',
+      customer_phone: payment.customer_phone || '',
+      status: 'active', is_trial: false, package_months: payment.package_months
+    });
+  }
+
+  await supabasePatch('payments', `id=eq.${payment.id}`, { payment_status: 'paid', paid_at: new Date().toISOString() });
+
+  return json({ ok: true, status: 'success', license_key: licenseKey, message: 'License activated' });
+}
+
+// ==========================================
+// HELPERS
 // ==========================================
 function generateLicenseKey() {
   const now = new Date();
-  const dateStr = now.getFullYear().toString() +
-    String(now.getMonth() + 1).padStart(2, '0') +
-    String(now.getDate()).padStart(2, '0');
-  const rand = Math.random().toString(36).substring(2, 10).toUpperCase();
-  return `L1.${dateStr}.${rand}`;
+  const d = now.getFullYear().toString() + String(now.getMonth()+1).padStart(2,'0') + String(now.getDate()).padStart(2,'0');
+  const r = Math.random().toString(36).substring(2,10).toUpperCase();
+  return `L1.${d}.${r}`;
 }
 
-function formatDate(d) {
-  const date = new Date(d);
-  return date.getFullYear() + '-' +
-    String(date.getMonth() + 1).padStart(2, '0') + '-' +
-    String(date.getDate()).padStart(2, '0');
+function fmtDate(d) {
+  const dt = new Date(d);
+  return dt.getFullYear() + '-' + String(dt.getMonth()+1).padStart(2,'0') + '-' + String(dt.getDate()).padStart(2,'0');
 }
 
 async function getByHwid(hwid) {
-  const res = await supabaseGet('licenses', `hwid=eq.${hwid}&limit=1`);
-  const data = await res.json();
-  return data && data.length > 0 ? data[0] : null;
+  const r = await supabaseGet('licenses', `hwid=eq.${hwid}&limit=1`);
+  const d = await r.json(); return d && d.length > 0 ? d[0] : null;
 }
 
 async function getByKey(key) {
-  const res = await supabaseGet('licenses', `license_key=eq.${key}&limit=1`);
-  const data = await res.json();
-  return data && data.length > 0 ? data[0] : null;
+  const r = await supabaseGet('licenses', `license_key=eq.${key}&limit=1`);
+  const d = await r.json(); return d && d.length > 0 ? d[0] : null;
 }
 
 async function supabaseGet(table, query) {
   return fetch(`${SUPABASE_URL}/rest/v1/${table}?${query}&select=*`, {
-    headers: {
-      'apikey': SUPABASE_ANON_KEY,
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
-    }
+    headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': `Bearer ${SUPABASE_ANON_KEY}` }
   });
 }
 
 async function supabasePost(table, data) {
   return fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
     method: 'POST',
-    headers: {
-      'apikey': SUPABASE_ANON_KEY,
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-      'Content-Type': 'application/json',
-      'Prefer': 'return=representation'
-    },
+    headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': `Bearer ${SUPABASE_ANON_KEY}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
     body: JSON.stringify(data)
   });
 }
@@ -357,21 +426,13 @@ async function supabasePost(table, data) {
 async function supabasePatch(table, filter, data) {
   return fetch(`${SUPABASE_URL}/rest/v1/${table}?${filter}`, {
     method: 'PATCH',
-    headers: {
-      'apikey': SUPABASE_ANON_KEY,
-      'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
-      'Content-Type': 'application/json',
-      'Prefer': 'return=representation'
-    },
+    headers: { 'apikey': SUPABASE_ANON_KEY, 'Authorization': `Bearer ${SUPABASE_ANON_KEY}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
     body: JSON.stringify(data)
   });
 }
 
-function jsonResponse(data) {
+function json(data) {
   return new Response(JSON.stringify(data), {
-    headers: {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*"
-    }
+    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': '*' }
   });
 }
