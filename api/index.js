@@ -18,78 +18,64 @@ const PACKAGES = {
 // MAIN HANDLER - route by URL path + POST body
 // ==========================================
 export default async function handler(req) {
-  // Handle CORS preflight
+  // CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response(null, {
-      headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': '*' }
+      headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS', 'Access-Control-Allow-Headers': '*' }
     });
   }
 
   const url = new URL(req.url);
   const path = url.pathname;
 
-  // Parse body: read as text first (stream can only be consumed once)
+  // Parse body: read as text first (stream consumed once)
   let body = {};
+  let rawBody = '';
   if (req.method === 'POST' || req.method === 'PUT') {
     try {
-      const raw = await req.text();
-      if (raw) {
+      rawBody = await req.text();
+      if (rawBody) {
         try {
-          body = JSON.parse(raw);
+          body = JSON.parse(rawBody);
         } catch(e) {
-          // Try form-urlencoded
-          raw.split('&').forEach(p => {
+          rawBody.split('&').forEach(p => {
             const eq = p.indexOf('=');
-            if (eq > 0) {
-              body[decodeURIComponent(p.substring(0, eq))] = decodeURIComponent(p.substring(eq + 1));
-            }
+            if (eq > 0) body[decodeURIComponent(p.substring(0, eq))] = decodeURIComponent(p.substring(eq + 1));
           });
         }
       }
     } catch(e) {}
   }
 
-  // Merge query params (body takes priority)
+  // Merge query params (body priority)
   url.searchParams.forEach((v, k) => { if (!(k in body)) body[k] = v; });
 
   const action = body.action || url.searchParams.get('action');
 
   try {
-    // Route by path - SPECIFIC paths first to avoid partial matches
-    if (path.includes('/api/license/check-payment')) {
-      return await checkPayment(body, path);
-    }
-    if (path.includes('/api/license/check-hwid')) {
-      return await checkByHwid(body);
-    }
-    if (path.includes('/api/license/check')) {
-      return await checkByHwid(body);
-    }
-    if (path.includes('/api/license/login')) {
-      return await loginWithKey(body);
-    }
-    if (path.includes('/api/license/register-payment')) {
-      return await registerPayment(body);
-    }
-    if (path.includes('/api/licenses/register')) {
-      return await registerTrial(body);
-    }
-    if (path.includes('/api/license/renew-request')) {
-      return await renewRequest(body);
+    // DEBUG endpoint - echo back what app sends
+    if (path.includes('/api/debug')) {
+      return json({ method: req.method, path, body, rawBody, headers: Object.fromEntries(req.headers) });
     }
 
-    // Route by action param (for browser/manual testing)
-    if (action === 'check') return await checkByHwid(body);
-    if (action === 'login') return await loginWithKey(body);
-    if (action === 'register') return await registerTrial(body);
-    if (action === 'payment') return await registerPayment(body);
+    // Route by path - SPECIFIC first
+    if (path.includes('/api/license/check-payment')) return await checkPayment(body, path);
+    if (path.includes('/api/license/check-hwid'))    return await checkByHwid(body);
+    if (path.includes('/api/license/check'))          return await checkByHwid(body);
+    if (path.includes('/api/license/login'))           return await loginWithKey(body);
+    if (path.includes('/api/license/register-payment')) return await register(body);
+    if (path.includes('/api/licenses/register'))        return await register(body);
+    if (path.includes('/api/license/renew-request'))    return await renewRequest(body);
+
+    // Action param fallback
+    if (action === 'check')    return await checkByHwid(body);
+    if (action === 'login')    return await loginWithKey(body);
+    if (action === 'register') return await register(body);
+    if (action === 'payment')  return await register(body);
     if (action === 'activate') return await activateLicense(body);
-    if (action === 'packages') return json({ ok: true, data: PACKAGES });
 
-    // Default: check by hwid
     if (body.hwid) return await checkByHwid(body);
-
-    return json({ ok: false, message: "Unknown endpoint" });
+    return json({ ok: false, message: 'Unknown endpoint' });
   } catch (e) {
     return json({ ok: false, message: e.message });
   }
@@ -192,102 +178,147 @@ async function loginWithKey(body) {
 }
 
 // ==========================================
-// REGISTER TRIAL (1 day, 1 time per HWID)
+// UNIFIED REGISTER (trial + payment in one)
 // ==========================================
-async function registerTrial(body) {
+async function register(body) {
   const hwid = body.hwid;
-  const name = body.customer_name || '';
-  const email = body.customer_email || '';
-  const phone = body.customer_phone || '';
-  const packageType = body.package_type;
-  const customMonths = parseInt(body.custom_months) || 0;
+  const name = body.customer_name || body.name || '';
+  const email = body.customer_email || body.email || '';
+  const phone = body.customer_phone || body.phone || '';
 
   if (!hwid) return json({ ok: false, status: 'error', message: 'Missing hwid' });
 
-  // Check existing
+  // Detect package from all possible fields
+  const months = detectMonths(body);
+  const pkg = months > 0 ? PACKAGES[months] : null;
+  const isTrial = !pkg;
+
+  // Check existing HWID
   const existing = await getByHwid(hwid);
-  if (existing) {
-    if (existing.trial_used) {
-      return json({ ok: false, status: 'exists', message: 'Trial already used on this device' });
+  if (existing && isTrial) {
+    return json({ ok: false, status: 'exists', message: 'Trial already used on this device' });
+  }
+
+  const licenseKey = body.license_key || (existing ? existing.license_key : generateLicenseKey());
+
+  if (!existing) {
+    // Create license
+    const expDays = pkg ? pkg.days : 1;
+    const expireDate = new Date();
+    expireDate.setDate(expireDate.getDate() + expDays);
+
+    const res = await supabasePost('licenses', {
+      hwid, license_key: licenseKey,
+      expire_date: fmtDate(expireDate),
+      customer_name: name, customer_email: email, customer_phone: phone,
+      status: pkg ? 'pending' : 'active',
+      trial_used: true, is_trial: isTrial,
+      package_months: months
+    });
+
+    if (!res.ok) {
+      const err = await res.json();
+      if (err.code === '23505') return json({ ok: false, status: 'exists', message: 'hwid.already.registered' });
+      return json({ ok: false, message: err.message || 'Register failed' });
     }
-    return json({ ok: false, status: 'exists', message: 'hwid.already.registered' });
   }
 
-  const licenseKey = generateLicenseKey();
-  const expireDate = new Date();
-  expireDate.setDate(expireDate.getDate() + 1);
+  // If paid package → create payment + QR
+  if (pkg) {
+    const paymentCode = `ZVT${licenseKey.replace(/\./g, '')}`;
+    const qrUrl = `https://img.vietqr.io/image/${BANK_CODE}-${BANK_ACCOUNT}-compact.png?amount=${pkg.amount}&addInfo=${encodeURIComponent(paymentCode)}&accountName=${encodeURIComponent(BANK_NAME)}`;
 
-  const res = await supabasePost('licenses', {
-    hwid, license_key: licenseKey,
-    expire_date: fmtDate(expireDate),
-    customer_name: name, customer_email: email, customer_phone: phone,
-    status: 'active', trial_used: true, is_trial: true, package_months: 0
-  });
+    await supabasePost('payments', {
+      license_key: licenseKey, hwid,
+      customer_name: name, customer_email: email, customer_phone: phone,
+      package_months: months, amount: pkg.amount,
+      transfer_content: paymentCode, payment_status: 'pending'
+    });
 
-  if (!res.ok) {
-    const err = await res.json();
-    if (err.code === '23505') return json({ ok: false, status: 'exists', message: 'hwid.already.registered' });
-    return json({ ok: false, message: err.message || 'Register failed' });
+    return json({
+      ok: true,
+      status: 'pending',
+      license_key: licenseKey,
+      license_token: licenseKey,
+      customer_name: name,
+      payment_code: paymentCode,
+      payment_info: {
+        payment_code: paymentCode,
+        amount: pkg.amount,
+        formatted_amount: pkg.amount.toLocaleString('vi-VN') + ' VND',
+        amount_formatted: pkg.amount.toLocaleString('vi-VN') + ' VND',
+        qr_code_url: qrUrl
+      },
+      bank_info: {
+        bank_name: 'MBBank',
+        account_number: BANK_ACCOUNT,
+        account_name: BANK_NAME
+      },
+      qr_code_url: qrUrl,
+      qr_url: qrUrl,
+      qr_code: qrUrl,
+      package_type: months,
+      package_label: pkg.label,
+      package_days: pkg.days,
+      amount: pkg.amount,
+      amount_formatted: pkg.amount.toLocaleString('vi-VN') + ' VND',
+      custom_months: months,
+      days_remaining: pkg.days
+    });
   }
 
+  // Trial (no package)
   return json({
     ok: true,
     status: 'success',
     license_key: licenseKey,
     license_token: licenseKey,
-    expire_date: fmtDate(expireDate),
+    expire_date: fmtDate(new Date(Date.now() + 86400000)),
     customer_name: name,
     days_remaining: 1
   });
 }
 
-// ==========================================
-// REGISTER PAYMENT (create QR)
-// ==========================================
-async function registerPayment(body) {
-  const hwid = body.hwid || '';
-  const name = body.customer_name || '';
-  const email = body.customer_email || '';
-  const phone = body.customer_phone || '';
-  const packageType = body.package_type;
-  const months = parseInt(body.custom_months || body.months) || 1;
+// Detect months from any field the app might send
+function detectMonths(body) {
+  // Direct months field
+  let m = parseInt(body.custom_months || body.months || body.package_months);
+  if (m && PACKAGES[m]) return m;
 
-  const pkg = PACKAGES[months];
-  if (!pkg) return json({ ok: false, message: 'Invalid package' });
+  // package_days → months
+  let d = parseInt(body.package_days);
+  if (d >= 300) return 12;
+  if (d >= 150) return 6;
+  if (d >= 60) return 3;
+  if (d >= 20) return 1;
 
-  const licenseKey = body.license_key || generateLicenseKey();
-  const paymentCode = `ZVT${licenseKey.replace(/\./g, '')}`;
-  const qrUrl = `https://img.vietqr.io/image/${BANK_CODE}-${BANK_ACCOUNT}-compact.png?amount=${pkg.amount}&addInfo=${encodeURIComponent(paymentCode)}&accountName=${encodeURIComponent(BANK_NAME)}`;
+  // package_type as months (1, 3, 6, 12)
+  let pt = body.package_type;
+  if (pt !== undefined && pt !== null) {
+    let ptNum = parseInt(pt);
+    if (PACKAGES[ptNum]) return ptNum;
+    // package_type as index (1=1mo, 2=3mo, 3=6mo, 4=12mo)
+    const pkgKeys = [1, 3, 6, 12];
+    if (ptNum >= 1 && ptNum <= 4) return pkgKeys[ptNum - 1];
+    // string match
+    if (typeof pt === 'string') {
+      const s = pt.toLowerCase();
+      if (s.includes('nam') || s.includes('year') || s.includes('annual')) return 12;
+      if (s.includes('6')) return 6;
+      if (s.includes('3') || s.includes('quarter')) return 3;
+      if (s.includes('1') || s.includes('month')) return 1;
+    }
+  }
 
-  await supabasePost('payments', {
-    license_key: licenseKey, hwid,
-    customer_name: name, customer_email: email, customer_phone: phone,
-    package_months: months, amount: pkg.amount,
-    transfer_content: paymentCode, payment_status: 'pending'
-  });
+  // Reverse lookup from amount
+  let amt = parseInt(body.amount);
+  if (amt) {
+    for (const [months, pkg] of Object.entries(PACKAGES)) {
+      if (pkg.amount === amt) return parseInt(months);
+    }
+  }
 
-  return json({
-    ok: true,
-    status: 'pending',
-    license_key: licenseKey,
-    payment_code: paymentCode,
-    payment_info: {
-      payment_code: paymentCode,
-      amount: pkg.amount,
-      formatted_amount: pkg.amount.toLocaleString('vi-VN') + ' VND',
-      amount_formatted: pkg.amount.toLocaleString('vi-VN') + ' VND'
-    },
-    bank_info: {
-      bank_name: 'MBBank',
-      account_number: BANK_ACCOUNT,
-      account_name: BANK_NAME
-    },
-    qr_code_url: qrUrl,
-    qr_url: qrUrl,
-    qr_code: qrUrl,
-    package_label: pkg.label,
-    package_days: pkg.days
-  });
+  return 0; // no package = trial
 }
 
 // ==========================================
