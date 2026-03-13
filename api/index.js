@@ -196,7 +196,37 @@ async function register(body) {
   // Check existing HWID
   const existing = await getByHwid(hwid);
   if (existing && isTrial) {
-    return json({ ok: false, status: 'exists', message: 'Trial already used on this device' });
+    // If license still active, return it so app can proceed
+    const now = new Date();
+    const expDate = new Date(existing.expire_date);
+    const daysRemaining = Math.max(0, Math.ceil((expDate - now) / 86400000));
+
+    if (existing.status === 'active' && expDate > now) {
+      return json({
+        ok: true,
+        status: 'active',
+        license_key: existing.license_key,
+        license_token: existing.license_key,
+        expire_date: existing.expire_date,
+        customer_name: existing.customer_name || name,
+        customer_email: existing.customer_email || email,
+        customer_phone: existing.customer_phone || phone,
+        days_remaining: daysRemaining,
+        server_time: now.toISOString()
+      });
+    }
+
+    // License expired → tell user to renew
+    return json({
+      ok: false,
+      status: 'expired',
+      need_action: 'renew',
+      license_key: existing.license_key,
+      expire_date: existing.expire_date,
+      customer_name: existing.customer_name,
+      days_remaining: 0,
+      message: 'Trial expired. Please purchase a license.'
+    });
   }
 
   const licenseKey = body.license_key || (existing ? existing.license_key : generateLicenseKey());
