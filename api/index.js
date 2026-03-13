@@ -8,10 +8,10 @@ const BANK_ACCOUNT = "0388906356";
 const BANK_NAME = "NGUYEN KHAC TRUNG KHAI";
 
 const PACKAGES = {
-  1:  { months: 1,  days: 30,  amount: 100000,  label: "1 tháng - 100,000 VNĐ" },
-  3:  { months: 3,  days: 90,  amount: 250000,  label: "3 tháng - 250,000 VNĐ" },
-  6:  { months: 6,  days: 180, amount: 450000,  label: "6 tháng - 450,000 VNĐ" },
-  12: { months: 12, days: 365, amount: 800000,  label: "1 năm - 800,000 VNĐ" }
+  1:  { months: 1,  days: 30,  amount: 299000,  label: "1 tháng - 299,000 VNĐ" },
+  3:  { months: 3,  days: 90,  amount: 800000,  label: "3 tháng - 800,000 VNĐ" },
+  6:  { months: 6,  days: 180, amount: 1500000,  label: "6 tháng - 1,5000,000 VNĐ" },
+  12: { months: 12, days: 365, amount: 2500000,  label: "1 năm - 2,500,000 VNĐ" }
 };
 
 // ==========================================
@@ -235,12 +235,20 @@ async function register(body) {
       transfer_content: paymentCode, payment_status: 'pending'
     });
 
+    const expireDate = new Date();
+    expireDate.setDate(expireDate.getDate() + pkg.days);
+
     return json({
       ok: true,
-      status: 'pending',
+      status: 'active',
       license_key: licenseKey,
       license_token: licenseKey,
+      expire_date: fmtDate(expireDate),
       customer_name: name,
+      customer_email: email,
+      customer_phone: phone,
+      days_remaining: pkg.days,
+      server_time: new Date().toISOString(),
       payment_code: paymentCode,
       payment_info: {
         payment_code: paymentCode,
@@ -262,20 +270,22 @@ async function register(body) {
       package_days: pkg.days,
       amount: pkg.amount,
       amount_formatted: pkg.amount.toLocaleString('vi-VN') + ' VND',
-      custom_months: months,
-      days_remaining: pkg.days
+      custom_months: months
     });
   }
 
   // Trial (no package)
   return json({
     ok: true,
-    status: 'success',
+    status: 'active',
     license_key: licenseKey,
     license_token: licenseKey,
     expire_date: fmtDate(new Date(Date.now() + 86400000)),
     customer_name: name,
-    days_remaining: 1
+    customer_email: email,
+    customer_phone: phone,
+    days_remaining: 1,
+    server_time: new Date().toISOString()
   });
 }
 
