@@ -211,7 +211,7 @@ async function register(body) {
       hwid, license_key: licenseKey,
       expire_date: fmtDate(expireDate),
       customer_name: name, customer_email: email, customer_phone: phone,
-      status: pkg ? 'pending' : 'active',
+      status: 'active',
       trial_used: true, is_trial: isTrial,
       package_months: months
     });
