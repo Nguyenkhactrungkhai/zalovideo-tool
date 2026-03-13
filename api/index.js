@@ -8,50 +8,71 @@ const BANK_ACCOUNT = "0388906356";
 const BANK_NAME = "NGUYEN KHAC TRUNG KHAI";
 
 const PACKAGES = {
-  1:  { months: 1,  days: 30,  amount: 299000,  label: "1 thang - 299,000 VND" },
-  3:  { months: 3,  days: 90,  amount: 800000,  label: "3 thang - 800,000 VND" },
-  6:  { months: 6,  days: 180, amount: 1500000, label: "6 thang - 1,500,000 VND" },
-  12: { months: 12, days: 365, amount: 2500000, label: "1 nam - 2,500,000 VND" }
+  1:  { months: 1,  days: 30,  amount: 100000,  label: "1 tháng - 100,000 VNĐ" },
+  3:  { months: 3,  days: 90,  amount: 250000,  label: "3 tháng - 250,000 VNĐ" },
+  6:  { months: 6,  days: 180, amount: 450000,  label: "6 tháng - 450,000 VNĐ" },
+  12: { months: 12, days: 365, amount: 800000,  label: "1 năm - 800,000 VNĐ" }
 };
 
 // ==========================================
 // MAIN HANDLER - route by URL path + POST body
 // ==========================================
 export default async function handler(req) {
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    return new Response(null, {
+      headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': '*' }
+    });
+  }
+
   const url = new URL(req.url);
   const path = url.pathname;
 
-  // Parse body (POST JSON) or query params
+  // Parse body: read as text first (stream can only be consumed once)
   let body = {};
-  if (req.method === 'POST') {
-    try { body = await req.json(); } catch(e) {
-      try {
-        const text = await req.text();
-        text.split('&').forEach(p => { const [k,v] = p.split('='); if(k) body[decodeURIComponent(k)] = decodeURIComponent(v||''); });
-      } catch(e2) {}
-    }
+  if (req.method === 'POST' || req.method === 'PUT') {
+    try {
+      const raw = await req.text();
+      if (raw) {
+        try {
+          body = JSON.parse(raw);
+        } catch(e) {
+          // Try form-urlencoded
+          raw.split('&').forEach(p => {
+            const eq = p.indexOf('=');
+            if (eq > 0) {
+              body[decodeURIComponent(p.substring(0, eq))] = decodeURIComponent(p.substring(eq + 1));
+            }
+          });
+        }
+      }
+    } catch(e) {}
   }
 
-  // Merge query params into body (body takes priority)
-  url.searchParams.forEach((v, k) => { if (!body[k]) body[k] = v; });
+  // Merge query params (body takes priority)
+  url.searchParams.forEach((v, k) => { if (!(k in body)) body[k] = v; });
 
-  // Also support ?action= for browser testing
   const action = body.action || url.searchParams.get('action');
 
   try {
-    // Route by path (original app format)
-    if (path.includes('/api/license/check-hwid') || path.includes('/api/license/check')) {
+    // Route by path - SPECIFIC paths first to avoid partial matches
+    if (path.includes('/api/license/check-payment')) {
+      return await checkPayment(body, path);
+    }
+    if (path.includes('/api/license/check-hwid')) {
+      return await checkByHwid(body);
+    }
+    if (path.includes('/api/license/check')) {
       return await checkByHwid(body);
     }
     if (path.includes('/api/license/login')) {
       return await loginWithKey(body);
     }
-    if (path.includes('/api/licenses/register') || path.includes('/api/license/register-payment')) {
-      if (path.includes('payment')) return await registerPayment(body);
-      return await registerTrial(body);
+    if (path.includes('/api/license/register-payment')) {
+      return await registerPayment(body);
     }
-    if (path.includes('/api/license/check-payment')) {
-      return await checkPayment(body, path);
+    if (path.includes('/api/licenses/register')) {
+      return await registerTrial(body);
     }
     if (path.includes('/api/license/renew-request')) {
       return await renewRequest(body);
